@@ -46,6 +46,8 @@ type SegmentAwareChunker struct {
 	mergedSegmentsTmp   []byte
 
 	insideBigSegment bool
+	// Position in the big segment, relative to its start
+	bigSegmentPos uint64
 }
 
 func parseSegmentAwareChunkerOptions(optionsStr string) (options segmentAwareChunkerOptions, err error) {
@@ -163,14 +165,12 @@ func (c *SegmentAwareChunker) Next() (uint64, []byte, error) {
 
 		// Return valid chunk from subchunker
 		if len(subBytes) != 0 {
+			c.bigSegmentPos = subStart + uint64(len(subBytes))
 			return c.currentOffset + subStart, subBytes, nil
 		}
 
 		// End processing "big" segment if subchunker is done.
-		c.insideBigSegment = false
-		c.currentOffset += c.segmentSizes[c.nextSegmentIdx]
-		c.nextSegmentIdx++
-
+		c.endBigSegment()
 	}
 
 	err := c.mergeMoreSmallSegments()
@@ -218,7 +218,15 @@ func (c *SegmentAwareChunker) Next() (uint64, []byte, error) {
 	// TODO: maybe align it to the end of file, if it's less than min bytes left and chuk will still not reach max?
 	// This will avoid producing a separate tail chunk that is too small.
 
+	c.bigSegmentPos = uint64(len(subBytes))
 	return c.currentOffset + subStart, subBytes, nil
+}
+
+func (c *SegmentAwareChunker) endBigSegment() {
+	c.insideBigSegment = false
+	c.bigSegmentPos = 0
+	c.currentOffset += c.segmentSizes[c.nextSegmentIdx]
+	c.nextSegmentIdx++
 }
 
 func (c *SegmentAwareChunker) fillSegmentSizes() error {
@@ -402,8 +410,60 @@ func (c *SegmentAwareChunker) nextFromMergedSegments() (uint64, []byte, error) {
 }
 
 func (c *SegmentAwareChunker) Advance(n int) error {
-	// TODO:
-	return fmt.Errorf("Advance is unsupported")
+	if n < 0 {
+		return fmt.Errorf("can't advance by negative %d bytes", n)
+	}
+	skip := uint64(n)
+
+	// Inside a big segment the subchunker holds what was read of it, let it skip
+	// up to the end of the segment.
+	if c.insideBigSegment {
+		step := min(skip, c.segmentSizes[c.nextSegmentIdx]-c.bigSegmentPos)
+		if err := c.subchunker.Advance(int(step)); err != nil {
+			return err
+		}
+		c.bigSegmentPos += step
+		skip -= step
+		if c.bigSegmentPos < c.segmentSizes[c.nextSegmentIdx] {
+			return nil
+		}
+		c.endBigSegment()
+	}
+	if skip == 0 {
+		return nil
+	}
+
+	// Walk the segments forward from the first one in the merge buffer, shortening
+	// the one the new position falls into.
+	idx := c.nextSegmentIdx - c.mergedSegmentsCount
+	skipped := skip
+	for skip > 0 {
+		if idx >= uint32(len(c.segmentSizes)) {
+			return fmt.Errorf("can't advance %d bytes past the end of the segments", skip)
+		}
+		size := c.segmentSizes[idx]
+		if skip < size {
+			c.segmentSizes[idx] = size - skip
+			break
+		}
+		skip -= size
+		idx++
+	}
+	c.currentOffset += skipped
+
+	// Keep what's left in the merge buffer, or discard the rest from the reader.
+	if skipped < c.mergedSegmentsSize {
+		copy(c.mergedSegments, c.mergedSegments[skipped:c.mergedSegmentsSize])
+		c.mergedSegmentsSize -= skipped
+		c.mergedSegmentsCount = c.nextSegmentIdx - idx
+		return nil
+	}
+	discard := skipped - c.mergedSegmentsSize
+	c.mergedSegmentsSize = 0
+	c.mergedSegmentsCount = 0
+	c.nextSegmentIdx = idx
+	_, err := io.CopyN(io.Discard, c.r, int64(discard))
+	return err
 }
 
 func (c *SegmentAwareChunker) Reset(r io.Reader) error {
